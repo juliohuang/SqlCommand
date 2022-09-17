@@ -23,7 +23,7 @@ namespace Frame.Utils.Command
         /// <param name="command"></param>
         public static void Process(this Exception exception, IDbCommand command)
         {
-          //  exception.Process(null, entity => { entity.Command = Prase(command); });
+            //  exception.Process(null, entity => { entity.Command = Prase(command); });
         }
 
         /// <summary>
@@ -41,13 +41,13 @@ namespace Frame.Utils.Command
             {
                 if (command == null) return "";
                 var stringBuilder = new StringBuilder();
-                stringBuilder.AppendLine(string.Format("DbCommand[CommandType.{0}]", command.CommandType));
+                stringBuilder.AppendLine($"DbCommand[CommandType.{command.CommandType}]");
 
                 foreach (DbParameter parameter in command.Parameters)
                 {
-                    string dbType = DBType(parameter);
+                    var dbType = DBType(parameter);
 
-                    stringBuilder.AppendLine(string.Format("declare {0} {1}", parameter.ParameterName, dbType));
+                    stringBuilder.AppendLine($"declare {parameter.ParameterName} {dbType}");
                 }
 
                 foreach (DbParameter parameter in command.Parameters)
@@ -73,10 +73,9 @@ namespace Frame.Utils.Command
                             }
                             catch (Exception)
                             {
-                                
-                             // throw;
+                                // throw;
                             }
-                         
+
                             break;
                         case DbType.Decimal:
                             stringBuilder.AppendFormat("set {0} = {1}", parameter.ParameterName, parameter.Value);
@@ -100,7 +99,8 @@ namespace Frame.Utils.Command
                         case DbType.Object:
                         case DbType.SByte:
                         case DbType.Single:
-                            stringBuilder.AppendFormat("set {0} = {1}", parameter.ParameterName, "??" + parameter.Value);
+                            stringBuilder.AppendFormat("set {0} = {1}", parameter.ParameterName,
+                                "??" + parameter.Value);
                             break;
                         case DbType.String:
                             stringBuilder.AppendFormat("set {0} = '{1}'", parameter.ParameterName, parameter.Value);
@@ -120,14 +120,16 @@ namespace Frame.Utils.Command
                         default:
                             throw new ArgumentOutOfRangeException();
                     }
+
                     stringBuilder.AppendLine();
                 }
+
                 stringBuilder.AppendLine(command.CommandText);
                 return stringBuilder.ToString();
             }
             catch (Exception ex)
             {
-               // ex.Process();
+                // ex.Process();
                 return "SQL解析失败";
             }
         }
@@ -183,6 +185,7 @@ namespace Frame.Utils.Command
                 default:
                     throw new ArgumentOutOfRangeException();
             }
+
             return dbType;
         }
     }
