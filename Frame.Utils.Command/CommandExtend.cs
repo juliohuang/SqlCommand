@@ -15,6 +15,10 @@ namespace Frame.Utils.Command
     {
         private static readonly Regex Regex = new Regex("@[0-9a-zA-Z#_]+", RegexOptions.None);
         private static readonly Regex Regex2 = new Regex("\\$[0-9a-zA-Z#_]+", RegexOptions.None);
+        
+        // 反射缓存
+        private static readonly Dictionary<Type, PropertyInfo[]> TypePropertyCache = new Dictionary<Type, PropertyInfo[]>();
+        private static readonly object TypePropertyCacheLock = new object();
 
         private static void ReadAll(this Command command, IList result, Type memberType,
             Dictionary<string, object> paras = null, string[] includes = null, IDbTransaction transaction = null)
@@ -151,6 +155,154 @@ namespace Frame.Utils.Command
             {
                 var t = result;
                 ReadOne(command, reader => t.Add(Convert.ChangeType(reader[0], memberType)), paras, false,
+                    transaction);
+            }
+        }
+
+        /// <summary>
+        /// 异步读取所有数据
+        /// </summary>
+        /// <param name="command"></param>
+        /// <param name="result"></param>
+        /// <param name="memberType"></param>
+        /// <param name="paras"></param>
+        /// <param name="includes"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        private static async Task ReadAllAsync(this Command command, IList result, Type memberType,
+            Dictionary<string, object> paras = null, string[] includes = null, IDbTransaction transaction = null)
+        {
+            if (memberType.IsArray)
+                await CommandAsync(command, async (dbCommand, list) =>
+                {
+                    using var reader = await ((DbCommand)dbCommand).ExecuteReaderAsync();
+                    var count = reader.FieldCount;
+                    var elementType = memberType.GetElementType();
+                    while (await reader.ReadAsync())
+                    {
+                        var array = Array.CreateInstance(elementType, count);
+                        for (var i = 0; i < count; i++) array.SetValue(reader[i], i);
+
+                        list.Add(array);
+                    }
+
+                    return list;
+                }, result, paras, transaction);
+
+            if (memberType.IsClass && memberType != typeof(string))
+            {
+                var hashtables = new Dictionary<string, Hashtable>();
+                if (includes != null && includes.Length > 0)
+                    foreach (var include in includes)
+                    {
+                        var strings = include.Split(".".ToCharArray());
+                        if (strings.Length > 1)
+                        {
+                            if (!hashtables.ContainsKey(strings[1]))
+                                hashtables.Add(strings[1], new Hashtable());
+                        }
+                        else
+                        {
+                            if (!hashtables.ContainsKey("@Key"))
+                                hashtables.Add("@Key", new Hashtable());
+                        }
+                    }
+
+                if (memberType.IsGenericType && memberType == typeof(Dictionary<string, object>))
+                {
+                    Func<IDataReader, List<string>, Task> readData = async (reader, list) =>
+                    {
+                        var readToObject = new Dictionary<string, object>();
+
+                        ReadToMap(reader, list, readToObject);
+
+                        result.Add(readToObject);
+                    };
+                    await CommandAsync(command, async dbCommand =>
+                    {
+                        using var reader = await ((DbCommand)dbCommand).ExecuteReaderAsync();
+                        var schemaColumns = SchemaColumns(reader.GetSchemaTable(), false);
+
+                        while (await reader.ReadAsync()) await readData(reader, schemaColumns);
+                    }, paras, transaction);
+                }
+                else
+                {
+                    PreRead<List<List<PropertyInfo>>> preRead = schemaTable => SchemaList(schemaTable, memberType);
+                    Func<IDataReader, List<List<PropertyInfo>>, Task> readData = async (reader, list) =>
+                    {
+                        var readToObject = ReadToObject(reader, list, memberType, command.Snake);
+                        foreach (var hashtable1 in hashtables)
+                        {
+                            var value = hashtable1.Key == "@Key" ? reader[0] : reader[hashtable1.Key];
+                            if (!hashtable1.Value.Contains(value))
+                                hashtable1.Value.Add(value, readToObject);
+                        }
+
+                        result.Add(readToObject);
+                    };
+                    if (includes != null && includes.Length > 0)
+                        await CommandAsync(command, async dbCommand =>
+                        {
+                            using var reader = await ((DbCommand)dbCommand).ExecuteReaderAsync();
+                            var data = preRead(reader.GetSchemaTable());
+                            while (await reader.ReadAsync()) await readData(reader, data);
+
+                            foreach (var name in includes)
+                            {
+                                if (!await reader.NextResultAsync()) break;
+
+                                var strings = name.Split(".".ToCharArray());
+                                var propertyInfo = memberType.GetProperty(strings[0]);
+                                var type = propertyInfo.PropertyType.GetGenericArguments()[0];
+                                PreRead<List<List<PropertyInfo>>> preRead2 =
+                                    schemaTable => SchemaList(schemaTable, type);
+                                Func<IDataReader, List<List<PropertyInfo>>, Task> readData2 = async (dataReader, list) =>
+                                {
+                                    var key =
+                                        dataReader[1];
+
+                                    var s = strings.Length > 1
+                                        ? strings[1]
+                                        : "@Key";
+                                    var obj =
+                                        hashtables[s][key];
+                                    if (obj == null) return;
+                                    if (!(propertyInfo
+                                        .GetValue(obj,
+                                            new object[0
+                                            ]) is IList o))
+                                    {
+                                        o =
+                                            Activator
+                                                    .CreateInstance
+                                                    (propertyInfo
+                                                        .PropertyType)
+                                                as IList;
+                                        propertyInfo
+                                            .SetValue(obj, o,
+                                                new object[0
+                                                ]);
+                                    }
+
+                                    o?.Add(
+                                        ReadToObject(
+                                            dataReader, list,
+                                            type, command.Snake));
+                                };
+
+                                var data2 = preRead2(reader.GetSchemaTable());
+                                while (await reader.ReadAsync()) await readData2(reader, data2);
+                            }
+                        }, paras, transaction);
+                    else
+                        await ReadAsync(command, preRead, readData, paras, false, transaction);
+                }
+            }
+            else
+            {
+                var t = result;
+                await ReadOneAsync(command, async reader => t.Add(Convert.ChangeType(reader[0], memberType)), paras, false,
                     transaction);
             }
         }
@@ -307,7 +459,13 @@ namespace Frame.Utils.Command
                             {
                                 try
                                 {
-                                    return propertyInfo.GetValue(paras, new object[0]);
+                                    var value = propertyInfo.GetValue(paras, new object[0]);
+                                    // 处理复杂对象，序列化为JSON
+                                    if (value != null && (propertyInfo.PropertyType.IsClass && propertyInfo.PropertyType != typeof(string)))
+                                    {
+                                        return Newtonsoft.Json.JsonConvert.SerializeObject(value);
+                                    }
+                                    return value;
                                 }
                                 catch (Exception e)
                                 {
@@ -326,7 +484,16 @@ namespace Frame.Utils.Command
                 {
                     var value = paras;
                     var strings = s.Substring(1);
-                    dictionary.Add(strings, dictionary1[strings]);
+                    var dictValue = dictionary1[strings];
+                    // 处理复杂对象，序列化为JSON
+                    if (dictValue != null && (dictValue.GetType().IsClass && dictValue.GetType() != typeof(string)))
+                    {
+                        dictionary.Add(strings, Newtonsoft.Json.JsonConvert.SerializeObject(dictValue));
+                    }
+                    else
+                    {
+                        dictionary.Add(strings, dictValue);
+                    }
                 }
             else
                 foreach (var s in paraNames)
@@ -353,7 +520,15 @@ namespace Frame.Utils.Command
                         }
                     }
 
-                    dictionary.Add(s, value);
+                    // 处理复杂对象，序列化为JSON
+                    if (value != null && (value.GetType().IsClass && value.GetType() != typeof(string)))
+                    {
+                        dictionary.Add(s, Newtonsoft.Json.JsonConvert.SerializeObject(value));
+                    }
+                    else
+                    {
+                        dictionary.Add(s, value);
+                    }
                     Ignore: ;
                 }
 
@@ -414,10 +589,31 @@ namespace Frame.Utils.Command
         private static List<List<PropertyInfo>> SchemaList(DataTable schemaTable, Type type)
         {
             var columns = SchemaColumns(schemaTable);
-            var propertyInfos = Array.FindAll(type.GetProperties(), c => c.CanRead).ToList();
+            var propertyInfos = GetPropertyInfos(type);
             var propertyLists =
                 columns.Select(column => GetPropertyList(column, propertyInfos)).Where(t => t != null && t.Count > 0);
             return propertyLists.ToList();
+        }
+
+        /// <summary>
+        /// 获取类型的属性信息，使用缓存
+        /// </summary>
+        /// <param name="type"></param>
+        /// <returns></returns>
+        private static List<PropertyInfo> GetPropertyInfos(Type type)
+        {
+            if (!TypePropertyCache.TryGetValue(type, out var propertyInfos))
+            {
+                lock (TypePropertyCacheLock)
+                {
+                    if (!TypePropertyCache.TryGetValue(type, out propertyInfos))
+                    {
+                        propertyInfos = Array.FindAll(type.GetProperties(), c => c.CanRead);
+                        TypePropertyCache[type] = propertyInfos;
+                    }
+                }
+            }
+            return propertyInfos.ToList();
         }
 
         private static List<string> SchemaColumns(DataTable schemaTable)
@@ -435,27 +631,7 @@ namespace Frame.Utils.Command
 
         private static List<PropertyInfo> GetPropertyList(string column, List<PropertyInfo> propertyInfos)
         {
-            //var contains = column.Contains("_");
             var infos = new List<PropertyInfo>();
-            // if (contains)
-            // {
-            //     var indexOf = column.IndexOf("_", StringComparison.Ordinal);
-            //     var propertyInfo =
-            //         propertyInfos.Find(
-            //             c =>
-            //                 string.Compare(c.Name, column.Substring(0, indexOf),
-            //                     StringComparison.CurrentCultureIgnoreCase) == 0);
-            //     if (propertyInfo == null) return infos;
-            //     infos.Add(propertyInfo);
-            //     var substring = column.Substring(indexOf + 1);
-            //     var list =
-            //         Array.FindAll(propertyInfo.PropertyType.GetProperties(), c => c.CanRead).ToList();
-            //     var propertyList = GetPropertyList(substring, list);
-            //     if (propertyList.Count == 0)
-            //         return propertyList;
-            //     infos.AddRange(propertyList);
-            // }
-            // else
             column = column.Replace("_", "");
             {
                 var propertyInfo =
@@ -521,6 +697,20 @@ namespace Frame.Utils.Command
                 return;
             }
 
+            // 处理JSON格式字段
+            if (o is string jsonString && (conversionType.IsClass || conversionType.IsGenericType))
+            {
+                try
+                {
+                    var value = Newtonsoft.Json.JsonConvert.DeserializeObject(jsonString, conversionType);
+                    propertyInfo.SetValue(t, value, new object[0]);
+                    return;
+                }
+                catch (Exception)
+                {
+                    // 不是JSON格式，继续处理
+                }
+            }
 
             if (conversionType.IsGenericType &&
                 conversionType.GetGenericTypeDefinition() == typeof(Nullable<>))
@@ -669,6 +859,149 @@ namespace Frame.Utils.Command
             return instance2;
         }
 
+        /// <summary>
+        /// 异步读取数据
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="command"></param>
+        /// <param name="paras"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        public static async Task<T> ReadAsync<T>(this Command command, object paras = null, IDbTransaction transaction = null)
+        {
+            var type = typeof(T);
+            var args = ToDictionary(command, paras);
+            if (type.IsArray)
+            {
+                var instance = default(T);
+                await ReadOneAsync(command, async reader =>
+                {
+                    instance = (T)await ReadToArrayAsync(reader);
+                }, args, true, transaction);
+                return instance;
+            }
+
+            var interfaces = type.GetInterfaces();
+            if (interfaces.Contains(typeof(IDictionary)))
+            {
+                var instance = Activator.CreateInstance<T>();
+                var dictionary = instance as IDictionary;
+                var dictionary1 = args;
+                await ReadToDictionaryAsync(command, dictionary, type, dictionary1, transaction);
+                return instance;
+            }
+
+            if (type.IsGenericType)
+            {
+                var typeDefinition = type.GetGenericTypeDefinition();
+                if (typeDefinition == typeof(List<>))
+                {
+                    var instance = Activator.CreateInstance<T>();
+                    await ReadAllAsync(command, paras, instance as IList, type.GetGenericArguments()[0], transaction);
+                    return instance;
+                }
+
+                if (typeDefinition == typeof(Tuple<,>)
+                    || typeDefinition == typeof(Tuple<,,>)
+                    || typeDefinition == typeof(Tuple<,,,>)
+                    || typeDefinition == typeof(Tuple<,,,,>)
+                    || typeDefinition == typeof(Tuple<,,,,,>)
+                    || typeDefinition == typeof(Tuple<,,,,,,>)
+                    || typeDefinition == typeof(ValueTuple<,,>)
+                    || typeDefinition == typeof(KeyValuePair<,>))
+                {
+                    var genericArguments = type.GetGenericArguments();
+                    if (genericArguments.Any(c => c.IsGenericType && c.GetGenericTypeDefinition() == typeof(List<>)))
+                    {
+                        var a = new object[type.GetGenericArguments().Length];
+                        await CommandAsync(command, async dbCommand =>
+                        {
+                            using var reader = await ((DbCommand)dbCommand).ExecuteReaderAsync();
+                            for (var index = 0; index < genericArguments.Length; index++)
+                            {
+                                if (index > 0)
+                                    await reader.NextResultAsync();
+
+                                var genericArgument = genericArguments[index];
+                                if (genericArgument.IsGenericType &&
+                                    genericArgument.GetGenericTypeDefinition() == typeof(List<>))
+                                {
+                                    var list1 = Activator.CreateInstance(genericArgument) as IList;
+                                    var memberType = genericArgument.GetGenericArguments()[0];
+
+                                    var data = SchemaList(reader.GetSchemaTable(), memberType);
+                                    while (await reader.ReadAsync())
+                                        list1.Add(ReadToObject(reader, data, memberType, command.Snake));
+
+                                    a[index] = list1;
+                                }
+                                else if (!genericArgument.IsClass || genericArgument == typeof(string))
+                                {
+                                    if (await reader.ReadAsync())
+                                    {
+                                        var o = reader[0];
+                                        if (!(o is DBNull)) a[index] = Convert.ChangeType(o, genericArgument);
+                                    }
+                                }
+                                else
+                                {
+                                    if (await reader.ReadAsync())
+                                    {
+                                        var schemaList = SchemaList(reader.GetSchemaTable(), genericArgument);
+                                        a[index] = ReadToObject(reader, schemaList, genericArgument, command.Snake);
+                                    }
+                                }
+                            }
+
+                            reader.Close();
+                        }, args, transaction);
+
+                        return (T)Activator.CreateInstance(type, a);
+                    }
+                }
+            }
+
+            if (type.BaseType == typeof(ValueTuple))
+            {
+                var constructorInfo = type.GetConstructors().First();
+                object t = null;
+                await CommandAsync(command, async dbCommand =>
+                {
+                    using var reader = await ((DbCommand)dbCommand).ExecuteReaderAsync();
+                    var objects = await ReadToArrayAsync(reader) as object[];
+                    t = (T)constructorInfo.Invoke(objects);
+                    reader.Close();
+                }, args, transaction);
+
+                return (T)t;
+            }
+
+            if (!type.IsClass ||
+                type == typeof(string))
+            {
+                var instance = default(T);
+                await ReadOneAsync(command, async reader =>
+                {
+                    var o = reader[0];
+                    if (o is DBNull)
+                        instance = default;
+                    else
+                        instance = (T)Convert.ChangeType(o, typeof(T));
+                }, args, true, transaction);
+
+                return instance;
+            }
+
+            var instance2 = default(T);
+            await ReadOneAsync(command, async reader =>
+            {
+                var schemaList = SchemaList(reader.GetSchemaTable(), typeof(T));
+                instance2 = ReadToObject<T>(reader, schemaList, command.Snake);
+            }, args, true, transaction);
+
+            return instance2;
+        }
+
         private static void ReadToDictionary(this Command command, IDictionary result, Type dictionaryType,
             Dictionary<string, object> paras = null,
             IDbTransaction transaction = null)
@@ -739,6 +1072,84 @@ namespace Frame.Utils.Command
         }
 
         /// <summary>
+        /// 异步读取到字典
+        /// </summary>
+        /// <param name="command"></param>
+        /// <param name="result"></param>
+        /// <param name="dictionaryType"></param>
+        /// <param name="paras"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        private static async Task ReadToDictionaryAsync(this Command command, IDictionary result, Type dictionaryType,
+            Dictionary<string, object> paras = null,
+            IDbTransaction transaction = null)
+        {
+            Type keyType = null;
+            Type valueType = null;
+            var needExtend = false;
+
+            Type type1 = null;
+            if (dictionaryType.IsGenericType)
+            {
+                var arguments = dictionaryType.GetGenericArguments();
+                if (arguments.Length == 2)
+                {
+                    keyType = arguments[0];
+                    valueType = arguments[1];
+                    if (arguments[1].IsClass && arguments[1] != typeof(string))
+                        needExtend = true;
+                    if (arguments[1].IsArray) type1 = arguments[1];
+                }
+            }
+
+            if (!needExtend)
+            {
+                await ReadOneAsync(command, async reader =>
+                {
+                    var key = keyType == null ? reader[0] : Convert.ChangeType(reader[0], keyType);
+                    if (result.Contains(key)) return;
+                    var value = valueType == null
+                        ? reader[1]
+                        : Convert.ChangeType(reader[1], valueType);
+                    result.Add(key, value);
+                }, paras, false, transaction);
+            }
+            else
+            {
+                if (type1 != null)
+                {
+                    Func<IDataReader, List<List<PropertyInfo>>, Task> readData = async (reader, list) =>
+                    {
+                        var fieldCount = reader.FieldCount;
+                        var objects = new object[fieldCount];
+                        await reader.GetValuesAsync(objects);
+                        var key = objects[0];
+                        if (result.Contains(key)) return;
+                        var array = Array.CreateInstance(type1.GetElementType(), fieldCount - 1);
+                        for (var index = 1; index < objects.Length; index++) array.SetValue(objects[index], index - 1);
+
+                        result.Add(Convert.ChangeType(key, keyType), array);
+                    };
+                    await ReadAsync(command, schemaTable => SchemaList(schemaTable, valueType), readData, paras, false,
+                        transaction);
+                }
+                else
+                {
+                    Func<IDataReader, List<List<PropertyInfo>>, Task> readData = async (reader, list) =>
+                    {
+                        var key = reader[0];
+                        if (result.Contains(key)) return;
+                        var instance = Activator.CreateInstance(valueType);
+                        ReadToObject(reader, list, instance, command.Snake);
+                        result.Add(Convert.ToString(key), instance);
+                    };
+                    await ReadAsync(command, schemaTable => SchemaList(schemaTable, valueType), readData, paras, false,
+                        transaction);
+                }
+            }
+        }
+
+        /// <summary>
         /// </summary>
         /// <param name="command"></param>
         /// <param name="paras"></param>
@@ -766,16 +1177,13 @@ namespace Frame.Utils.Command
         {
             var connection = transaction != null
                 ? transaction.Connection
-                : Commands.DbConnection(command.DbName ?? "main");
+                : Commands.GetConnection(command.DbName ?? "main");
 
-            var dbCommand = connection.CreateCommand();
-
+            var dbCommand = Commands.GetCachedCommand(connection, command.Text);
 
             dbCommand.CommandType = command.CommandType;
             //dbCommand.CommandTimeout = 3000000;
             if (paras != null && paras.Count > 0) MakeParameters(dbCommand, paras);
-
-            dbCommand.CommandText = command.Text;
 
             var stopwatch = Stopwatch.StartNew();
             try
@@ -797,7 +1205,108 @@ namespace Frame.Utils.Command
             {
                 stopwatch.Process(dbCommand);
                 if (transaction == null)
+                {
                     connection.CloseIfOpen();
+                    Commands.ReleaseConnection(command.DbName ?? "main", connection);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 异步执行命令
+        /// </summary>
+        /// <param name="command"></param>
+        /// <param name="commandProcess"></param>
+        /// <param name="paras"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        private static async Task CommandAsync(this Command command, Func<IDbCommand, Task> commandProcess,
+            Dictionary<string, object> paras = null, IDbTransaction transaction = null)
+        {
+            var connection = transaction != null
+                ? transaction.Connection
+                : Commands.GetConnection(command.DbName ?? "main");
+
+            var dbCommand = Commands.GetCachedCommand(connection, command.Text);
+
+            dbCommand.CommandType = command.CommandType;
+            if (paras != null && paras.Count > 0) MakeParameters(dbCommand, paras);
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                if (transaction != null)
+                    dbCommand.Transaction = transaction;
+                else
+                    connection.OpenIfClose();
+
+                await commandProcess(dbCommand);
+            }
+            catch (Exception ex)
+            {
+                transaction?.Rollback();
+                ex.Process(dbCommand);
+                throw;
+            }
+            finally
+            {
+                stopwatch.Process(dbCommand);
+                if (transaction == null)
+                {
+                    connection.CloseIfOpen();
+                    Commands.ReleaseConnection(command.DbName ?? "main", connection);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 异步执行命令并返回结果
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="command"></param>
+        /// <param name="commandProcess"></param>
+        /// <param name="result"></param>
+        /// <param name="paras"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        private static async Task<T> CommandAsync<T>(this Command command, Func<IDbCommand, T, Task<T>> commandProcess, T result,
+            Dictionary<string, object> paras = null, IDbTransaction transaction = null)
+        {
+            var connection = transaction != null
+                ? transaction.Connection
+                : Commands.GetConnection(command.DbName ?? "main");
+
+            var dbCommand = Commands.GetCachedCommand(connection, command.Text);
+
+            dbCommand.CommandType = command.CommandType;
+            dbCommand.CommandTimeout = 30000;
+
+            MakeParameters(dbCommand, paras);
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                if (transaction != null)
+                    dbCommand.Transaction = transaction;
+                else
+                    connection.OpenIfClose();
+
+                return await commandProcess(dbCommand, result);
+            }
+            catch (Exception ex)
+            {
+                transaction?.Rollback();
+                ex.Process(dbCommand);
+                throw;
+            }
+            finally
+            {
+                stopwatch.Process(dbCommand);
+                if (transaction == null)
+                {
+                    connection.CloseIfOpen();
+                    Commands.ReleaseConnection(command.DbName ?? "main", connection);
+                }
             }
         }
 
@@ -813,15 +1322,12 @@ namespace Frame.Utils.Command
         {
             var connection = transaction != null
                 ? transaction.Connection
-                : Commands.DbConnection(command.DbName ?? "main");
+                : Commands.GetConnection(command.DbName ?? "main");
 
-            var dbCommand = connection.CreateCommand();
+            var dbCommand = Commands.GetCachedCommand(connection, command.Text);
 
-
-            dbCommand.CommandText = command.Text;
             dbCommand.CommandType = command.CommandType;
             dbCommand.CommandTimeout = 30000;
-
 
             MakeParameters(dbCommand, paras);
 
@@ -845,7 +1351,10 @@ namespace Frame.Utils.Command
             {
                 stopwatch.Process(dbCommand);
                 if (transaction == null)
+                {
                     connection.CloseIfOpen();
+                    Commands.ReleaseConnection(command.DbName ?? "main", connection);
+                }
             }
         }
 
@@ -881,6 +1390,35 @@ namespace Frame.Utils.Command
             }, paras, transaction);
         }
 
+        /// <summary>
+        /// 异步读取数据
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="command"></param>
+        /// <param name="preRead"></param>
+        /// <param name="readData"></param>
+        /// <param name="paras"></param>
+        /// <param name="oneRow"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        private static async Task ReadAsync<T>(this Command command, PreRead<T> preRead, Func<IDataReader, T, Task> readData,
+            Dictionary<string, object> paras, bool oneRow, IDbTransaction transaction = null)
+        {
+            await CommandAsync(command, async dbCommand =>
+            {
+                using var reader = await ((DbCommand)dbCommand).ExecuteReaderAsync();
+
+                var data = preRead(reader.GetSchemaTable());
+                while (await reader.ReadAsync())
+                {
+                    await readData(reader, data);
+                    if (oneRow) break;
+                }
+
+                reader.Close();
+            }, paras, transaction);
+        }
+
         private static void ReadOne(this Command command, ReadData readData, Dictionary<string, object> paras,
             bool oneRow,
             IDbTransaction transaction = null)
@@ -899,6 +1437,50 @@ namespace Frame.Utils.Command
         }
 
         /// <summary>
+        /// 异步读取单行数据
+        /// </summary>
+        /// <param name="command"></param>
+        /// <param name="readData"></param>
+        /// <param name="paras"></param>
+        /// <param name="oneRow"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        private static async Task ReadOneAsync(this Command command, Func<IDataReader, Task> readData, Dictionary<string, object> paras,
+            bool oneRow,
+            IDbTransaction transaction = null)
+        {
+            await CommandAsync(command, async dbCommand =>
+            {
+                using var reader = await ((DbCommand)dbCommand).ExecuteReaderAsync();
+                while (await reader.ReadAsync())
+                {
+                    await readData(reader);
+                    if (oneRow) break;
+                }
+
+                reader.Close();
+            }, paras, transaction);
+        }
+
+        /// <summary>
+        /// 异步读取到数组
+        /// </summary>
+        /// <param name="reader"></param>
+        /// <returns></returns>
+        private static async Task<object> ReadToArrayAsync(IDataReader reader)
+        {
+            var array = new object[reader.FieldCount];
+            await reader.GetValuesAsync(array);
+            for (var index = 0; index < array.Length; index++)
+            {
+                var data = array[index];
+                array.SetValue(data != DBNull.Value ? data : null, index);
+            }
+
+            return array;
+        }
+
+        /// <summary>
         ///     处理存储过程
         /// </summary>
         /// <param name="command"></param>
@@ -910,11 +1492,10 @@ namespace Frame.Utils.Command
         {
             var connection = transaction != null
                 ? transaction.Connection
-                : Commands.DbConnection(command.DbName ?? "main");
+                : Commands.GetConnection(command.DbName ?? "main");
 
-            var dbCommand = connection.CreateCommand();
+            var dbCommand = Commands.GetCachedCommand(connection, command.Text);
 
-            dbCommand.CommandText = command.Text;
             dbCommand.CommandType = CommandType.StoredProcedure;
 
             foreach (var dataParameter in parameters) dbCommand.Parameters.Add(dataParameter);
@@ -943,7 +1524,10 @@ namespace Frame.Utils.Command
             {
                 stopwatch.Process(dbCommand);
                 if (transaction == null)
+                {
                     connection.CloseIfOpen();
+                    Commands.ReleaseConnection(command.DbName ?? "main", connection);
+                }
             }
         }
     }
