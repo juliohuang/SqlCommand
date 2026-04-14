@@ -247,6 +247,8 @@ Commands.ExecuteWithTransaction(transaction =>
 
 ### 4.3 异步操作
 
+#### 异步读取数据
+
 ```csharp
 // 异步读取单个对象
 var command = Commands.GetCommand("SELECT * FROM Users WHERE Id = @Id", "main");
@@ -254,7 +256,70 @@ var user = await command.ReadAsync<User>(new { Id = 1 });
 
 // 异步读取列表
 var listCommand = Commands.GetCommand("SELECT * FROM Users", "main");
-var users = await command.ReadAsync<List<User>>();
+var users = await listCommand.ReadAsync<List<User>>();
+
+// 异步读取不同类型
+var countCommand = Commands.GetCommand("SELECT COUNT(*) FROM Users", "main");
+var count = await countCommand.ReadAsync<int>();
+
+var priceCommand = Commands.GetCommand("SELECT Price FROM Products WHERE Id = @Id", "main");
+var price = await priceCommand.ReadAsync<decimal>(new { Id = 1 });
+```
+
+#### 异步执行非查询命令
+
+```csharp
+// 异步更新操作
+var updateCommand = Commands.GetCommand("UPDATE Users SET Age = @Age WHERE Id = @Id", "main");
+var result = await updateCommand.ExecAsync(new { Age = 31, Id = 1 });
+
+// 异步插入操作
+var insertCommand = Commands.GetCommand("INSERT INTO Users (Name, Age) VALUES (@Name, @Age)", "main");
+var insertResult = await insertCommand.ExecAsync(new { Name = "Bob", Age = 35 });
+```
+
+#### 异步处理存储过程
+
+```csharp
+// 准备参数
+var parameters = new SqlParameter[]
+{
+    new SqlParameter("@Name", "Alice"),
+    new SqlParameter("@Age", 28)
+};
+
+// 异步执行存储过程
+var processCommand = Commands.GetCommand("InsertUser", "main");
+var result = await processCommand.ProcessAsync(parameters);
+```
+
+#### 并行执行多个异步操作
+
+```csharp
+// 并行执行多个异步操作
+var tasks = new[]
+{
+    Task.Run(async () => {
+        var command = Commands.GetCommand("SELECT * FROM Users WHERE Id = @Id", "main");
+        return await command.ReadAsync<User>(new { Id = 1 });
+    }),
+    Task.Run(async () => {
+        var command = Commands.GetCommand("SELECT * FROM Users WHERE Id = @Id", "main");
+        return await command.ReadAsync<User>(new { Id = 2 });
+    }),
+    Task.Run(async () => {
+        var command = Commands.GetCommand("SELECT COUNT(*) FROM Users", "main");
+        return await command.ReadAsync<int>();
+    })
+};
+
+// 等待所有任务完成
+var results = await Task.WhenAll(tasks);
+
+// 处理结果
+var user1 = results[0] as User;
+var user2 = results[1] as User;
+var count = (int)results[2];
 ```
 
 ## 5. API 文档
