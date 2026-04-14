@@ -1167,6 +1167,24 @@ namespace Frame.Utils.Command
         }
 
         /// <summary>
+        /// 异步执行非查询命令
+        /// </summary>
+        /// <param name="command"></param>
+        /// <param name="paras"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        private static async Task<bool> ExecAsync(this Command command, Dictionary<string, object> paras = null,
+            IDbTransaction transaction = null)
+        {
+            return await CommandAsync(
+                command,
+                async (dbCommand, result) => (await ((DbCommand)dbCommand).ExecuteNonQueryAsync()) > 0,
+                false,
+                paras,
+                transaction);
+        }
+
+        /// <summary>
         /// </summary>
         /// <param name="command"></param>
         /// <param name="commandProcess"></param>
@@ -1512,6 +1530,57 @@ namespace Frame.Utils.Command
                 dbParameter.Direction = ParameterDirection.ReturnValue;
                 dbCommand.Parameters.Add(dbParameter);
                 dbCommand.ExecuteNonQuery();
+                return dbParameter.Value;
+            }
+            catch (Exception ex)
+            {
+                transaction?.Rollback();
+                ex.Process(dbCommand);
+                throw;
+            }
+            finally
+            {
+                stopwatch.Process(dbCommand);
+                if (transaction == null)
+                {
+                    connection.CloseIfOpen();
+                    Commands.ReleaseConnection(command.DbName ?? "main", connection);
+                }
+            }
+        }
+
+        /// <summary>
+        ///     异步处理存储过程
+        /// </summary>
+        /// <param name="command"></param>
+        /// <param name="parameters"></param>
+        /// <param name="transaction"></param>
+        /// <returns></returns>
+        public static async Task<object> ProcessAsync(this Command command, IDataParameter[] parameters,
+            IDbTransaction transaction = null)
+        {
+            var connection = transaction != null
+                ? transaction.Connection
+                : Commands.GetConnection(command.DbName ?? "main");
+
+            var dbCommand = Commands.GetCachedCommand(connection, command.Text);
+
+            dbCommand.CommandType = CommandType.StoredProcedure;
+
+            foreach (var dataParameter in parameters) dbCommand.Parameters.Add(dataParameter);
+
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                if (transaction != null)
+                    dbCommand.Transaction = transaction;
+                else
+                    connection.OpenIfClose();
+                var dbParameter = dbCommand.CreateParameter();
+                dbParameter.ParameterName = "RetVal";
+                dbParameter.Direction = ParameterDirection.ReturnValue;
+                dbCommand.Parameters.Add(dbParameter);
+                await ((DbCommand)dbCommand).ExecuteNonQueryAsync();
                 return dbParameter.Value;
             }
             catch (Exception ex)
